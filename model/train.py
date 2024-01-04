@@ -5,6 +5,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.optim.lr_scheduler as lr_scheduler
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -30,7 +31,7 @@ def save_checkpoint(
     optimizer: torch.optim,
     val_loss: float,
 ):
-    file_path = os.path.join(CHECKPOINT_FOLDER, f"checkpoint_{epoch}.pth")
+    file_path = os.path.join(CHECKPOINT_FOLDER, f"checkpoint_{epoch+1}.pth")
 
     state = {
         "epoch": epoch,
@@ -71,73 +72,6 @@ class Metrics:
 
 
 class Regularization:
-    @staticmethod
-    def early_stop(
-        c_epoch: int,
-        val_loss: float,
-        patience_counter: int,
-        es_patience: int,
-        best_val_loss: float,
-        model: nn.Module,
-    ) -> tuple:
-        """Stops training if the validation loss changes
-
-        Args:
-            c_epoch (int): The current epoch.
-            val_loss (float): The loss from the validation set.
-            patience_counter (int): The amount of times, validation loss decrease.
-            es_patience (int): The limit to the early stopping.
-            best_val_loss (float): The best validation loss performance.
-            model (nn.Module): The model being trained.
-
-        Returns:
-            tuple: The current patience counter and whether to continue.
-        """
-        # Check for early stopping
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            output_path = os.path.join(OUTPUT_FOLDER, f"best_model_{c_epoch}.pth")
-
-            torch.save(model.state_dict(), output_path)
-            save_checkpoint()
-
-            return (patience_counter, True)
-        else:
-            # Validation loss has not improved increment counter
-            patience_counter += 1
-            if patience_counter >= es_patience:
-                print("Early stopping triggered.")
-                return (0, False)
-
-            return (patience_counter, True)
-
-
-class TrainerOutput:
-    @staticmethod
-    def pre_epoch(
-        epoch: int, patience_counter: int, es_patience: int, best_val_loss: float
-    ):
-        print(f"Training Epoch: {epoch}")
-        print((f"Patience Counter: {patience_counter}/{es_patience}"))
-        print(f"Best Validation Loss: {best_val_loss}")
-
-    @staticmethod
-    def post_val(val_loss: float, val_loader: DataLoader, val_accuracy):
-        print(f"Validation Loss: {val_loss / len(val_loader):.4f}")
-        print(
-            f"Validation Accuracy: Age - {val_accuracy[0]:.2f}, Ethnicity - {val_accuracy[1]:.2f}, Gender - {val_accuracy[2]:.2f}"
-        )
-
-
-class Trainer:
-    """Trainer object for training the model"""
-
-    # Whether the model should stop training
-    _exit = False
-
-    # early stopping patience
-    _es_patience = 5
-
     # min delta dunno what for?
     _min_delta = 0.01
 
@@ -147,13 +81,95 @@ class Trainer:
     # Patience for counter
     _patience_counter = 0
 
+    def __init__(self, patience: int = 8) -> None:
+        self._es_patience = patience
+
+    def early_stop(
+        self,
+        c_epoch: int,
+        val_loss: float,
+        model: nn.Module,
+    ) -> bool:
+        """Stops training if the validation loss changes
+
+        Args:
+            c_epoch (int): The current epoch.
+            model (nn.Module): The model being trained.
+
+        Returns:
+            bool: Whether training should stop
+        """
+
+        print((f"Patience Counter: {self._patience_counter}/{self._es_patience}"))
+        print(f"Best Validation Loss: {self._best_val_loss}\n")
+
+        # Check for early stopping
+        if val_loss < self._best_val_loss:
+            self._best_val_loss = val_loss
+            output_path = os.path.join(
+                OUTPUT_FOLDER, f"best_val_loss_model_{c_epoch}.pth"
+            )
+            torch.save(model.state_dict(), output_path)
+
+            return False
+        else:
+            # Validation loss has not improved increment counter
+            self._patience_counter += 1
+            if self._patience_counter >= self._es_patience:
+                output_path = os.path.join(OUTPUT_FOLDER, f"es_model_{c_epoch}.pth")
+                torch.save(model.state_dict(), output_path)
+
+                print("Early stopping triggered.")
+                return True
+
+            return False
+
+
+class TrainerOutput:
+    @staticmethod
+    def pre_epoch(epoch: int):
+        print(f"Training Epoch: {epoch+1}")
+
+    @staticmethod
+    def post_train(train_loss: float, train_loader: DataLoader, train_accuracy: float):
+        print("\nCompleted Training:")
+        print(f"Train Loss: {train_loss / len(train_loader):.4f}")
+        print(
+            f"Train Accuracy: Age - {train_accuracy[0]:.2f}, Ethnicity - {train_accuracy[1]:.2f}, Gender - {train_accuracy[2]:.2f}"
+        )
+        print("")
+
+    @staticmethod
+    def post_val(val_loss: float, val_loader: DataLoader, val_accuracy: list):
+        print("Completed Validation:")
+        print(f"Validation Loss: {val_loss / len(val_loader):.4f}")
+        print(
+            f"Validation Accuracy: Age - {val_accuracy[0]:.2f}, Ethnicity - {val_accuracy[1]:.2f}, Gender - {val_accuracy[2]:.2f}"
+        )
+
+
+# TODO: Implement checkpoint restore
+class Trainer:
+    """Trainer object for training the model"""
+
+    # Whether the model should stop training
+    _exit = False
+
     # The criterion to be used
     _criterion = nn.CrossEntropyLoss()
     # Device for model/datasets to be set to
     _device = torch.device(get_device())
-
     # Epochs of training
-    _n_epochs = 30
+    _n_epochs = 50
+
+    # Train metrics
+    _train_loss = 0
+    _train_accuracy = []
+
+    # Validation metrics
+    _val_loss = 0
+    _val_accuracy = []
+    _val_loss_per_batch = 0
 
     def __init__(
         self,
@@ -162,20 +178,23 @@ class Trainer:
         model: nn.Module,
         checkpoint: Optional[str] = None,
     ) -> None:
+        self._optimizer = optim.Adam(model.parameters(), lr=0.001)
+
         self._train_loader = train_loader
         self._val_loader = val_loader
         self._model = model
         self._checkpoint = checkpoint
-        self.optimizer = optim.Adam(model.parameters(), lr=0.0001)
+        self._regularlisation = Regularization()
 
-    def _callbacks(self):
+        self._scheduler = lr_scheduler.ExponentialLR(self._optimizer, gamma=0.7)
+
+    def _callbacks(self, c_epoch: int):
         """Callbacks to run after training."""
-        self._patience_counter, self._exit = Regularization.early_stop()
+        self._exit = self._regularlisation.early_stop(
+            c_epoch=c_epoch, val_loss=self._val_loss_per_batch, model=self._model
+        )
 
-    def _train_epoch(self, epoch: int):
-        train_loss = 0
-        train_accuracy = []
-
+    def _train_epoch(self, epoch: int) -> None:
         # Lets use tqdm to get some cool training bars
         with tqdm(
             total=len(self._train_loader),
@@ -209,8 +228,8 @@ class Trainer:
                 loss.backward()
                 self._optimizer.step()
 
-                train_loss += loss.item()
-                train_accuracy.append(
+                self._train_loss += loss.item()
+                self._train_accuracy.append(
                     Metrics.calculate_accuracy(
                         (age_pred, ethnicity_pred, gender_pred),
                         (y_age_batch, y_ethnicity_batch, y_gender_batch),
@@ -218,16 +237,21 @@ class Trainer:
                 )
 
                 pbar.update(1)
-                pbar.set_postfix_str(f"Training Loss: {train_loss / (pbar.n + 1):.4f}")
+                pbar.set_postfix_str(
+                    f"Training Loss: {self._train_loss / (pbar.n + 1):.4f}"
+                )
 
         # Calculate mean training accuracy over each output
-        train_accuracy = torch.mean(torch.tensor(train_accuracy), dim=0)
+        train_accuracy = torch.mean(torch.tensor(self._train_accuracy), dim=0)
+        TrainerOutput.post_train(
+            train_loss=self._train_loss,
+            train_loader=self._train_loader,
+            train_accuracy=train_accuracy,
+        )
 
-    def _validate_epoch(self):
+    def _validate_epoch(self) -> None:
         # Validation step
         self._model.eval()
-        val_loss = 0
-        val_accuracy = []
 
         with torch.no_grad():
             for (
@@ -235,7 +259,7 @@ class Trainer:
                 y_age_batch,
                 y_ethnicity_batch,
                 y_gender_batch,
-            ) in self._val_loader:
+            ) in tqdm(self._val_loader, desc="Validating", leave=False):
                 # Move tensors to the device
                 X_batch = X_batch.to(self._device)
                 y_age_batch = y_age_batch.to(self._device)
@@ -252,8 +276,8 @@ class Trainer:
                     + self._criterion(gender_pred, y_gender_batch)
                 )
 
-                val_loss += loss.item()
-                val_accuracy.append(
+                self._val_loss += loss.item()
+                self._val_accuracy.append(
                     Metrics.calculate_accuracy(
                         (age_pred, ethnicity_pred, gender_pred),
                         (y_age_batch, y_ethnicity_batch, y_gender_batch),
@@ -261,23 +285,34 @@ class Trainer:
                 )
 
         # Calculate mean validation accuracy over each output
-        val_accuracy = torch.mean(torch.tensor(val_accuracy), dim=0)
+        val_accuracy = torch.mean(torch.tensor(self._val_accuracy), dim=0)
+
+        # Calculate the loss per batch
+        self._val_loss_per_batch = self._val_loss / len(self._val_loader)
 
         # Print the post train output
         TrainerOutput.post_val(
-            val_loss=val_loss, val_loader=self._val_loader, val_accuracy=val_accuracy
+            val_loss=self._val_loss,
+            val_loader=self._val_loader,
+            val_accuracy=val_accuracy,
         )
 
-    def train(self):
+    def train(self) -> None:
         self._model = self._model.to(self._device)
 
         for epoch in range(self._n_epochs):
+            self._train_loss = 0
+            self._train_accuracy = []
+            self._val_loss = 0
+            self._val_loss_per_batch = 0
+            self._val_accuracy = []
+
             # Stop the model training
             if self._exit:
                 break
 
             # Pre Epoch print useful training things
-            self._pre_epoch()
+            TrainerOutput.pre_epoch(epoch=epoch)
 
             # Set the model to train
             self._model.train()
@@ -288,12 +323,27 @@ class Trainer:
             self._validate_epoch()
 
             # Run the callbacks
-            self._callbacks()
+            self._callbacks(c_epoch=epoch)
+
+            # Step the scheduler
+            self._scheduler.step()
+
+            # Save a checkpoint of training
+            save_checkpoint(
+                epoch=epoch,
+                model=self._model,
+                optimizer=self._optimizer,
+                val_loss=self._val_loss,
+            )
 
 
 def main():
     train_loader, val_loader = get_datasets()
     model = MultiOutputConv()
+
+    trainer = Trainer(train_loader=train_loader, val_loader=val_loader, model=model)
+
+    trainer.train()
 
 
 if __name__ == "__main__":

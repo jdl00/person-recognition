@@ -1,7 +1,7 @@
 # Directories
 __pycache__/
 datasets/
-.DS_STORE/
+.DS_STORE
 .venv/
 
 
