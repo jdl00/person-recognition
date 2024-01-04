@@ -1,0 +1,10 @@
+# Directories
+__pycache__/
+datasets/
+.DS_STORE/
+.venv/
+
+
+# File extensions
+*.pth
+
